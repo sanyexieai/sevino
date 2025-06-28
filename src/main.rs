@@ -1,23 +1,25 @@
 use axum::{
+    extract::{Path, State},
+    http::StatusCode,
     routing::{get, post, put, delete},
     response::Json,
     Router,
-    extract::{Path, State},
-    body::Bytes,
-    http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::time::Instant;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 mod models;
-mod utils;
 mod services;
+mod utils;
 mod config;
 
 use crate::config::Settings;
 use crate::services::{StorageService, BucketService, ObjectService};
+use crate::models::{Bucket, Object, ObjectMetadata};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -35,17 +37,12 @@ use crate::services::{StorageService, BucketService, ObjectService};
         get_object_metadata
     ),
     components(
-        schemas(Bucket, Object, ObjectMetadata, HealthResponse, CreateBucketRequest, BucketListResponse, ObjectListResponse)
+        schemas(Bucket, Object, ObjectMetadata, ApiResponse<Bucket>, ApiResponse<Vec<Bucket>>, ApiResponse<Object>, ApiResponse<Vec<Object>>, ApiResponse<ObjectMetadata>, ApiResponse<()>, HealthResponse, CreateBucketRequest, BucketListResponse, ObjectListResponse)
     ),
     tags(
-        (name = "health", description = "Health check endpoints"),
         (name = "buckets", description = "Bucket management endpoints"),
-        (name = "objects", description = "Object management endpoints")
-    ),
-    info(
-        title = "Sevino Object Storage API",
-        description = "A high-performance object storage service API",
-        version = "1.0.0"
+        (name = "objects", description = "Object management endpoints"),
+        (name = "health", description = "Health check endpoints")
     )
 )]
 struct ApiDoc;
@@ -95,7 +92,7 @@ async fn main() {
     let addr = format!("{}:{}", settings.host, settings.port);
     println!("Server running on http://{}", addr);
     println!("Swagger UI available at http://{}/swagger-ui/", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -105,11 +102,11 @@ async fn main() {
     path = "/",
     tag = "health",
     responses(
-        (status = 200, description = "API information", body = String)
+        (status = 200, description = "Welcome message")
     )
 )]
 async fn root() -> &'static str {
-    "Sevino Object Storage Service\n\nAPI Endpoints:\n- GET /health - Health check\n- GET /api/buckets - List buckets\n- POST /api/buckets - Create bucket\n- DELETE /api/buckets/<name> - Delete bucket\n- GET /api/buckets/<name>/objects - List objects\n- PUT /api/buckets/<name>/objects/<key> - Upload object\n- GET /api/buckets/<name>/objects/<key> - Download object\n- DELETE /api/buckets/<name>/objects/<key> - Delete object\n\nSwagger UI: /swagger-ui/"
+    "Welcome to Sevino Object Storage Service!"
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -123,14 +120,15 @@ struct HealthResponse {
     path = "/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service health status", body = HealthResponse)
+        (status = 200, description = "Health check response", body = HealthResponse)
     )
 )]
 async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
+    let response = HealthResponse {
+        status: "healthy".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
-    })
+    };
+    Json(response)
 }
 
 #[utoipa::path(
@@ -158,7 +156,7 @@ struct CreateBucketRequest {
     post,
     path = "/api/buckets",
     tag = "buckets",
-    request_body = CreateBucketRequest,
+    request_body(content = CreateBucketRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Bucket created successfully", body = ApiResponse<Bucket>),
         (status = 400, description = "Invalid bucket name", body = ApiResponse<Bucket>)
@@ -234,7 +232,7 @@ async fn list_objects(
     State(state): State<Arc<AppState>>,
     Path(bucket_name): Path<String>,
 ) -> Json<ApiResponse<ObjectListResponse>> {
-    match state.object_service.list_objects(&bucket_name, None, None, None).await {
+    match state.object_service.list_objects(&bucket_name, None, None, None, None).await {
         Ok(objects) => {
             let response = ObjectListResponse { objects };
             Json(ApiResponse::success(response))
@@ -260,7 +258,7 @@ async fn list_objects(
 async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket_name, key)): Path<(String, String)>,
-    body: Bytes,
+    body: axum::body::Bytes,
 ) -> Json<ApiResponse<Object>> {
     let data = body.to_vec();
     let content_type = "application/octet-stream";
@@ -384,5 +382,3 @@ impl<T> ApiResponse<T> {
         }
     }
 }
-
-use crate::models::{Bucket, Object, ObjectMetadata};

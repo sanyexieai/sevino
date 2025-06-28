@@ -13,6 +13,7 @@ use serde_json;
 pub struct StorageService {
     data_dir: PathBuf,
     buckets: Arc<RwLock<HashMap<String, Bucket>>>,
+    object_index: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
 }
 
 impl StorageService {
@@ -27,9 +28,13 @@ impl StorageService {
         // 加载现有桶
         let buckets = Self::load_buckets(&data_path).await?;
         
+        // 构建对象索引
+        let object_index = Self::build_object_index(&data_path).await?;
+        
         Ok(Self {
             data_dir: data_path,
             buckets: Arc::new(RwLock::new(buckets)),
+            object_index: Arc::new(RwLock::new(object_index)),
         })
     }
     
@@ -65,6 +70,53 @@ impl StorageService {
         }
         
         Ok(buckets)
+    }
+    
+    async fn build_object_index(data_dir: &Path) -> Result<HashMap<String, HashMap<String, String>>> {
+        let mut index = HashMap::new();
+        
+        if data_dir.exists() {
+            for entry in fs::read_dir(data_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                
+                if path.is_dir() {
+                    let bucket_name = path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| anyhow!("Invalid bucket name"))?;
+                    
+                    // 跳过系统目录
+                    if bucket_name.starts_with('.') {
+                        continue;
+                    }
+                    
+                    let mut bucket_index = HashMap::new();
+                    let meta_dir = path.join(".sevino.meta").join("objects");
+                    
+                    if meta_dir.exists() {
+                        for meta_entry in fs::read_dir(meta_dir)? {
+                            let meta_entry = meta_entry?;
+                            let meta_path = meta_entry.path();
+                            
+                            if meta_path.is_file() && meta_path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                                if let Ok(content) = fs::read_to_string(&meta_path) {
+                                    if let Ok(metadata) = serde_json::from_str::<ObjectMetadata>(&content) {
+                                        let object_id = Self::generate_object_id(bucket_name, &metadata.key);
+                                        bucket_index.insert(metadata.key, object_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !bucket_index.is_empty() {
+                        index.insert(bucket_name.to_string(), bucket_index);
+                    }
+                }
+            }
+        }
+        
+        Ok(index)
     }
     
     /// 生成对象ID（类似MinIO的哈希化文件名）
@@ -168,22 +220,59 @@ impl StorageService {
     }
     
     pub async fn list_object_metadata(&self, bucket_name: &str) -> Result<Vec<ObjectMetadata>> {
+        self.list_object_metadata_with_pagination(bucket_name, None, None).await
+    }
+    
+    pub async fn list_object_metadata_with_pagination(
+        &self,
+        bucket_name: &str,
+        max_keys: Option<usize>,
+        marker: Option<String>,
+    ) -> Result<Vec<ObjectMetadata>> {
         let meta_dir = self.data_dir
             .join(bucket_name)
             .join(".sevino.meta")
             .join("objects");
         
         let mut objects = Vec::new();
+        let mut count = 0;
+        let max_keys = max_keys.unwrap_or(usize::MAX);
         
         if meta_dir.exists() {
-            for entry in fs::read_dir(meta_dir)? {
-                let entry = entry?;
+            let mut entries: Vec<_> = fs::read_dir(meta_dir)?
+                .filter_map(|entry| entry.ok())
+                .collect();
+            
+            // 按文件名排序，确保一致性
+            entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            
+            let mut started = marker.is_none();
+            
+            for entry in entries {
+                if count >= max_keys {
+                    break;
+                }
+                
                 let path = entry.path();
                 
                 if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                    // 处理marker逻辑
+                    if !started {
+                        if let Some(marker_val) = &marker {
+                            let file_name = path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("");
+                            if file_name == marker_val {
+                                started = true;
+                            }
+                            continue;
+                        }
+                    }
+                    
                     if let Ok(content) = fs::read_to_string(&path) {
                         if let Ok(metadata) = serde_json::from_str::<ObjectMetadata>(&content) {
                             objects.push(metadata);
+                            count += 1;
                         }
                     }
                 }
@@ -195,15 +284,76 @@ impl StorageService {
     
     /// 根据key查找对象ID
     pub async fn find_object_id_by_key(&self, bucket_name: &str, key: &str) -> Result<Option<String>> {
-        let objects = self.list_object_metadata(bucket_name).await?;
+        let index = self.object_index.read().await;
         
-        for obj in objects {
-            if obj.key == key {
-                return Ok(Some(Self::generate_object_id(bucket_name, key)));
+        if let Some(bucket_index) = index.get(bucket_name) {
+            if let Some(object_id) = bucket_index.get(key) {
+                return Ok(Some(object_id.clone()));
             }
         }
         
         Ok(None)
+    }
+    
+    /// 添加对象到索引
+    pub async fn add_object_to_index(&self, bucket_name: &str, key: &str, object_id: &str) -> Result<()> {
+        let mut index = self.object_index.write().await;
+        
+        let bucket_index = index.entry(bucket_name.to_string())
+            .or_insert_with(HashMap::new);
+        
+        bucket_index.insert(key.to_string(), object_id.to_string());
+        
+        Ok(())
+    }
+    
+    /// 从索引中删除对象
+    pub async fn remove_object_from_index(&self, bucket_name: &str, key: &str) -> Result<()> {
+        let mut index = self.object_index.write().await;
+        
+        if let Some(bucket_index) = index.get_mut(bucket_name) {
+            bucket_index.remove(key);
+            
+            // 如果桶索引为空，删除整个桶索引
+            if bucket_index.is_empty() {
+                index.remove(bucket_name);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 获取桶中对象数量（使用索引，O(1)性能）
+    pub async fn get_bucket_object_count(&self, bucket_name: &str) -> usize {
+        let index = self.object_index.read().await;
+        
+        if let Some(bucket_index) = index.get(bucket_name) {
+            bucket_index.len()
+        } else {
+            0
+        }
+    }
+    
+    /// 检查桶是否为空（使用索引，O(1)性能）
+    pub async fn is_bucket_empty(&self, bucket_name: &str) -> bool {
+        self.get_bucket_object_count(bucket_name).await == 0
+    }
+    
+    /// 重建对象索引（用于修复索引不一致问题）
+    pub async fn rebuild_object_index(&self) -> Result<()> {
+        let new_index = Self::build_object_index(&self.data_dir).await?;
+        let mut index = self.object_index.write().await;
+        *index = new_index;
+        Ok(())
+    }
+    
+    /// 验证索引一致性
+    pub async fn validate_index_consistency(&self, bucket_name: &str) -> Result<bool> {
+        let index_count = self.get_bucket_object_count(bucket_name).await;
+        let disk_objects = self.list_object_metadata(bucket_name).await?;
+        let disk_count = disk_objects.len();
+        
+        Ok(index_count == disk_count)
     }
 }
 
@@ -251,9 +401,8 @@ impl BucketService {
             return Err(anyhow!("Bucket '{}' not found", name));
         }
         
-        // 检查桶是否为空
-        let objects = self.storage.list_object_metadata(name).await?;
-        if !objects.is_empty() {
+        // 检查桶是否为空（使用索引，O(1)性能）
+        if !self.storage.is_bucket_empty(name).await {
             return Err(anyhow!("Cannot delete non-empty bucket '{}'", name));
         }
         
@@ -324,6 +473,9 @@ impl ObjectService {
         let metadata: ObjectMetadata = object.clone().into();
         self.storage.save_object_metadata(bucket_name, &object_id, &metadata).await?;
         
+        // 更新索引
+        self.storage.add_object_to_index(bucket_name, key, &object_id).await?;
+        
         Ok(object)
     }
     
@@ -375,6 +527,9 @@ impl ObjectService {
         // 删除元数据
         self.storage.delete_object_metadata(bucket_name, &object_id).await?;
         
+        // 更新索引
+        self.storage.remove_object_from_index(bucket_name, key).await?;
+        
         Ok(())
     }
     
@@ -400,6 +555,7 @@ impl ObjectService {
         prefix: Option<String>,
         delimiter: Option<String>,
         max_keys: Option<u32>,
+        marker: Option<String>,
     ) -> Result<Vec<Object>> {
         // 检查桶是否存在
         let bucket = self.storage.buckets.read().await;
@@ -408,7 +564,12 @@ impl ObjectService {
         }
         drop(bucket);
         
-        let metadata_objects = self.storage.list_object_metadata(bucket_name).await?;
+        // 使用分页获取元数据
+        let metadata_objects = self.storage.list_object_metadata_with_pagination(
+            bucket_name,
+            max_keys.map(|k| k as usize),
+            marker,
+        ).await?;
         
         // 转换为Object列表
         let mut objects: Vec<Object> = metadata_objects.into_iter().map(|obj| Object::new(
@@ -451,11 +612,6 @@ impl ObjectService {
                 }
             }
             objects = filtered_objects;
-        }
-        
-        // 应用最大键数限制
-        if let Some(max_keys) = max_keys {
-            objects.truncate(max_keys as usize);
         }
         
         Ok(objects)
