@@ -53,6 +53,14 @@ pub struct ObjectMetadata {
     pub last_modified: DateTime<Utc>,
     /// 用户自定义元数据
     pub user_metadata: HashMap<String, String>,
+    /// 版本ID（用于版本控制）
+    pub version_id: Option<String>,
+    /// 是否为删除标记（用于版本控制）
+    pub is_delete_marker: bool,
+    /// 引用计数（用于去重）
+    pub reference_count: u32,
+    /// 数据持有者对象ID（如果为None，则自己是数据持有者）
+    pub data_holder_id: Option<String>,
 }
 
 impl Bucket {
@@ -99,6 +107,10 @@ impl From<Object> for ObjectMetadata {
             created_at: obj.created_at,
             last_modified: obj.last_modified,
             user_metadata: obj.user_metadata,
+            version_id: None,
+            is_delete_marker: false,
+            reference_count: 0,
+            data_holder_id: None,
         }
     }
 } 
