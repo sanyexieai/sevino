@@ -8,6 +8,10 @@ pub struct Settings {
     pub data_dir: String,
     pub max_file_size: u64,
     pub enable_cors: bool,
+    pub cors_origins: Vec<String>,
+    pub cors_methods: Vec<String>,
+    pub cors_headers: Vec<String>,
+    pub cors_allow_credentials: bool,
 }
 
 impl Default for Settings {
@@ -18,6 +22,28 @@ impl Default for Settings {
             data_dir: "./data".to_string(),
             max_file_size: 100 * 1024 * 1024, // 100MB
             enable_cors: true,
+            cors_origins: vec![
+                "http://localhost:3000".to_string(),
+                "http://127.0.0.1:3000".to_string(),
+                "http://localhost:8080".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+                "*".to_string(), // 允许所有域名（开发环境）
+            ],
+            cors_methods: vec![
+                "GET".to_string(),
+                "POST".to_string(),
+                "PUT".to_string(),
+                "DELETE".to_string(),
+                "OPTIONS".to_string(),
+            ],
+            cors_headers: vec![
+                "Content-Type".to_string(),
+                "Authorization".to_string(),
+                "X-Requested-With".to_string(),
+                "Accept".to_string(),
+                "Origin".to_string(),
+            ],
+            cors_allow_credentials: false,
         }
     }
 }
@@ -48,6 +74,35 @@ impl Settings {
         
         if let Ok(enable_cors) = env::var("SEVINO_ENABLE_CORS") {
             settings.enable_cors = enable_cors.to_lowercase() == "true";
+        }
+        
+        // CORS配置
+        if let Ok(cors_origins) = env::var("SEVINO_CORS_ORIGINS") {
+            settings.cors_origins = cors_origins
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        
+        if let Ok(cors_methods) = env::var("SEVINO_CORS_METHODS") {
+            settings.cors_methods = cors_methods
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        
+        if let Ok(cors_headers) = env::var("SEVINO_CORS_HEADERS") {
+            settings.cors_headers = cors_headers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        
+        if let Ok(allow_credentials) = env::var("SEVINO_CORS_ALLOW_CREDENTIALS") {
+            settings.cors_allow_credentials = allow_credentials.to_lowercase() == "true";
         }
         
         settings
