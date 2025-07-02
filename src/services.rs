@@ -1266,9 +1266,11 @@ impl ObjectService {
             metadata.content_type = ct;
         }
 
-        // 更新用户元数据（如果提供）
+        // 更新用户元数据（如果提供）- 只更新传递过来的字段，不覆盖未传递的字段
         if let Some(um) = user_metadata {
-            metadata.user_metadata = um;
+            for (key, value) in um {
+                metadata.user_metadata.insert(key, value);
+            }
         }
 
         // 更新ETag（如果提供）
