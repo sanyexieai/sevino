@@ -95,4 +95,34 @@ pub fn get_mime_type(filename: &str) -> String {
         "wav" => "audio/wav",
         _ => "application/octet-stream",
     }.to_string()
+}
+
+/// 验证ETag格式
+pub fn is_valid_etag_format(etag: &str) -> bool {
+    // 支持以下格式：
+    // 1. "hash" - 标准ETag
+    // 2. W/"weak-etag" - 弱ETag
+    // 3. "sha256-hash" - SHA256格式
+    // 4. "version-id" - 版本标识
+    
+    if etag.is_empty() {
+        return false;
+    }
+    
+    // 弱ETag格式: W/"weak-etag"
+    if etag.starts_with("W/\"") && etag.ends_with("\"") {
+        return true;
+    }
+    
+    // 标准ETag格式: "hash"
+    if etag.starts_with("\"") && etag.ends_with("\"") {
+        return true;
+    }
+    
+    // 无引号格式（向后兼容）
+    if !etag.contains('"') && !etag.contains(' ') {
+        return true;
+    }
+    
+    false
 } 

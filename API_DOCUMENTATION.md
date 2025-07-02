@@ -359,35 +359,22 @@ GET /api/buckets/{bucket_name}/objects
 - `delimiter` (string, 可选): 分隔符
 - `max_keys` (integer, 可选): 最大返回数量，默认1000
 - `marker` (string, 可选): 分页标记
+- `etag_filter` (string, 可选): ETag过滤，支持通配符
+- `custom_xxx` (string, 可选): 按自定义元数据过滤，如 `custom_bizid=123`
 
-**响应**:
-```json
-{
-  "success": true,
-  "data": {
-    "objects": [
-      {
-        "id": "obj-123",
-        "key": "example.txt",
-        "bucket_name": "my-bucket",
-        "size": 1024,
-        "etag": "d41d8cd98f00b204e9800998ecf8427e",
-        "content_type": "text/plain",
-        "created_at": "2024-01-01T00:00:00Z",
-        "last_modified": "2024-01-01T00:00:00Z",
-        "user_metadata": {
-          "author": "user1"
-        }
-      }
-    ]
-  },
-  "error": null
-}
-```
+**自定义元数据过滤说明**:
+- 通过在查询参数中添加 `custom_标签名=值`，可以筛选 user_metadata 里对应键值的对象。例如 `custom_bizid=123` 只返回 user_metadata 里 `bizid=123` 的对象。
+- 支持多个 custom_xxx 组合过滤（AND关系），如 `custom_bizid=123&custom_tag=abc` 会筛选出同时满足 bizid=123 且 tag=abc 的对象。
+- 仅支持字符串类型的 user_metadata 字段。
+- 如果 user_metadata 中没有该字段，或值不等于指定值，则不会返回该对象。
 
 **示例**:
 ```bash
-curl -X GET "http://127.0.0.1:8000/api/buckets/my-bucket/objects"
+# 按自定义标签 bizid 过滤
+curl -X GET "http://127.0.0.1:8000/api/buckets/my-bucket/objects?custom_bizid=123"
+
+# 按多个自定义标签组合过滤
+curl -X GET "http://127.0.0.1:8000/api/buckets/my-bucket/objects?custom_bizid=123&custom_tag=abc"
 ```
 
 #### 上传对象
@@ -405,8 +392,10 @@ PUT /api/buckets/{bucket_name}/objects/{key}
 **查询参数**:
 - `deduplication_mode` (string, 可选): 去重模式，可选值：`reject`, `allow`, `reference`
 - `content_type` (string, 可选): 内容类型，默认为 `application/octet-stream`
+- `custom` (string, 可选): 自定义元数据，json字符串，内容会合并到user_metadata
 
-**请求体**: 二进制数据
+**自定义元数据示例**:
+- `custom={"bizid":"123","tag":"abc"}`
 
 **去重模式说明**:
 - `reject`: 拒绝重复内容，如果检测到相同内容则返回错误
@@ -422,11 +411,11 @@ PUT /api/buckets/{bucket_name}/objects/{key}
     "key": "example.txt",
     "bucket_name": "my-bucket",
     "size": 1024,
-    "etag": "d41d8cd98f00b204e9800998ecf8427e",
+    "etag": "\"d41d8cd98f00b204e9800998ecf8427e\"",
     "content_type": "text/plain",
     "created_at": "2024-01-01T00:00:00Z",
     "last_modified": "2024-01-01T00:00:00Z",
-    "user_metadata": {}
+    "user_metadata": { "bizid": "123", "tag": "abc" }
   },
   "error": null
 }
@@ -439,15 +428,62 @@ curl -X PUT "http://127.0.0.1:8000/api/buckets/my-bucket/objects/example.txt" \
   -H "Content-Type: text/plain" \
   --data-binary "Hello, World!"
 
-# 使用去重模式
-curl -X PUT "http://127.0.0.1:8000/api/buckets/my-bucket/objects/example.txt?deduplication_mode=reference" \
+# 添加自定义元数据
+curl -X PUT "http://127.0.0.1:8000/api/buckets/my-bucket/objects/example.txt?custom={\"bizid\":\"123\",\"tag\":\"abc\"}" \
   -H "Content-Type: text/plain" \
   --data-binary "Hello, World!"
-
-# 指定内容类型
-curl -X PUT "http://127.0.0.1:8000/api/buckets/my-bucket/objects/image.jpg?content_type=image/jpeg" \
-  --data-binary @image.jpg
 ```
+
+#### 修改对象元数据
+
+```http
+PUT /api/buckets/{bucket_name}/objects/{key}/metadata
+Content-Type: application/json
+```
+
+**描述**：只修改对象的元数据（如 content_type、user_metadata、ETag），不影响对象内容。
+
+**路径参数**:
+- `bucket_name` (string, 必需): 桶名称
+- `key` (string, 必需): 对象键
+
+**请求体**（application/json，可选字段只传需要修改的）:
+| 字段名         | 类型                | 说明                                 |
+|----------------|---------------------|--------------------------------------|
+| content_type   | string (可选)       | 新的内容类型                         |
+| user_metadata  | object (可选)       | 新的自定义元数据（键值对）           |
+| custom_etag    | string (可选)       | 新的自定义ETag，需符合ETag格式要求   |
+
+**示例**:
+```bash
+curl -X PUT "http://127.0.0.1:8000/api/buckets/my-bucket/objects/example.txt/metadata" \
+  -H "Content-Type: application/json" \
+  -d '{"content_type":"text/plain","user_metadata":{"tag":"abc"},"custom_etag":"\"my-custom-etag\""}'
+```
+
+**响应**:
+```json
+{
+  "success": true,
+  "data": {
+    "id": "obj-123",
+    "key": "example.txt",
+    "bucket_name": "my-bucket",
+    "size": 1024,
+    "etag": "\"my-custom-etag\"",
+    "content_type": "text/plain",
+    "created_at": "2024-01-01T00:00:00Z",
+    "last_modified": "2024-01-01T00:00:00Z",
+    "user_metadata": { "tag": "abc" }
+  },
+  "error": null
+}
+```
+
+**注意事项**：
+- 只会修改元数据，不会影响对象内容。
+- custom_etag 必须符合ETag格式，否则返回400。
+- user_metadata 只支持字符串类型的键值对。
 
 #### 分片上传
 

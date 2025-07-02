@@ -1,5 +1,5 @@
 use crate::models::{Bucket, Object, ObjectMetadata};
-use crate::utils::{validate_bucket_name, validate_object_key, generate_etag, get_mime_type, sanitize_path, sha256_hash};
+use crate::utils::{validate_bucket_name, validate_object_key, generate_etag, get_mime_type, sanitize_path, sha256_hash, is_valid_etag_format};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use serde_json;
 use chrono;
 use std::time::{SystemTime, UNIX_EPOCH};
+use regex;
 
 /// 重复数据删除模式
 #[derive(Debug, Clone)]
@@ -557,10 +558,22 @@ impl ObjectService {
         content_type: &str,
         user_metadata: HashMap<String, String>,
     ) -> Result<Object> {
-        self.put_object_with_versioning(bucket_name, key, data, content_type, user_metadata, false).await
+        self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, None).await
     }
     
-    pub async fn put_object_with_versioning(
+    pub async fn put_object_with_custom_etag(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        user_metadata: HashMap<String, String>,
+        custom_etag: Option<String>,
+    ) -> Result<Object> {
+        self.put_object_with_versioning_and_custom_etag(bucket_name, key, data, content_type, user_metadata, false, custom_etag).await
+    }
+    
+    pub async fn put_object_with_versioning_and_custom_etag(
         &self,
         bucket_name: &str,
         key: &str,
@@ -568,6 +581,7 @@ impl ObjectService {
         content_type: &str,
         user_metadata: HashMap<String, String>,
         enable_versioning: bool,
+        custom_etag: Option<String>,
     ) -> Result<Object> {
         validate_object_key(key).map_err(|e| anyhow!(e))?;
         
@@ -578,7 +592,8 @@ impl ObjectService {
         }
         drop(bucket);
         
-        let etag = generate_etag(&data);
+        // 使用自定义ETag或生成默认ETag
+        let etag = custom_etag.unwrap_or_else(|| generate_etag(&data));
         let mime_type = if content_type == "application/octet-stream" {
             get_mime_type(key)
         } else {
@@ -770,7 +785,21 @@ impl ObjectService {
         user_metadata: HashMap<String, String>,
         deduplication_mode: DeduplicationMode,
     ) -> Result<Object> {
-        let etag = generate_etag(&data);
+        self.put_object_with_deduplication_and_custom_etag(bucket_name, key, data, content_type, user_metadata, deduplication_mode, None).await
+    }
+    
+    /// 智能上传：如果内容已存在，可以选择创建引用或拒绝上传（支持自定义ETag）
+    pub async fn put_object_with_deduplication_and_custom_etag(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        data: Vec<u8>,
+        content_type: &str,
+        user_metadata: HashMap<String, String>,
+        deduplication_mode: DeduplicationMode,
+        custom_etag: Option<String>,
+    ) -> Result<Object> {
+        let etag = custom_etag.clone().unwrap_or_else(|| generate_etag(&data));
         
         // 检查是否存在相同内容的其他文件
         let duplicate_keys = self.find_duplicate_content_keys(bucket_name, &etag, Some(key)).await?;
@@ -783,87 +812,65 @@ impl ObjectService {
                         duplicate_keys.join(", ")
                     ));
                 }
-                self.put_object(bucket_name, key, data, content_type, user_metadata).await
+                self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
             },
             DeduplicationMode::Allow => {
                 // 允许重复，正常上传
-                self.put_object(bucket_name, key, data, content_type, user_metadata).await
+                self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
             },
             DeduplicationMode::Reference => {
                 if !duplicate_keys.is_empty() {
-                    // 找到引用计数最高的对象作为数据持有者
-                    let mut best_holder_id = None;
-                    let mut max_reference_count = 0;
-                    
-                    for duplicate_key in &duplicate_keys {
-                        if let Some(object_id) = self.storage.find_object_id_by_key(bucket_name, duplicate_key).await? {
-                            if let Some(metadata) = self.storage.load_object_metadata(bucket_name, &object_id).await? {
-                                let current_ref_count = if metadata.data_holder_id.is_none() {
-                                    metadata.reference_count
-                                } else {
-                                    // 如果这个对象指向其他数据持有者，计算间接引用数
-                                    if let Some(holder_id) = &metadata.data_holder_id {
-                                        if let Some(holder_metadata) = self.storage.load_object_metadata(bucket_name, holder_id).await? {
-                                            holder_metadata.reference_count
-                                        } else {
-                                            0
-                                        }
-                                    } else {
-                                        0
-                                    }
-                                };
+                    // 找到重复内容，创建引用
+                    if let Some(first_duplicate_key) = duplicate_keys.first() {
+                        // 找到第一个重复对象的ID
+                        if let Some(existing_object_id) = self.storage.find_object_id_by_key(bucket_name, first_duplicate_key).await? {
+                            if let Some(existing_metadata) = self.storage.load_object_metadata(bucket_name, &existing_object_id).await? {
+                                // 创建引用对象
+                                let new_object = Object::new(
+                                    key.to_string(),
+                                    bucket_name.to_string(),
+                                    existing_metadata.size,
+                                    existing_metadata.content_type.clone(),
+                                    existing_metadata.etag.clone(),
+                                    user_metadata,
+                                );
                                 
-                                if current_ref_count > max_reference_count {
-                                    max_reference_count = current_ref_count;
-                                    best_holder_id = Some(object_id);
-                                }
+                                // 生成新的对象ID
+                                let new_object_id = StorageService::generate_object_id(bucket_name, key);
+                                
+                                // 创建引用元数据
+                                let mut new_metadata: ObjectMetadata = new_object.clone().into();
+                                new_metadata.data_holder_id = Some(existing_object_id.clone());
+                                new_metadata.reference_count = 0; // 引用对象本身不计数
+                                
+                                // 保存引用元数据
+                                self.storage.save_object_metadata(bucket_name, &new_object_id, &new_metadata).await?;
+                                
+                                // 更新数据持有者的引用计数
+                                let mut updated_existing_metadata = existing_metadata.clone();
+                                updated_existing_metadata.reference_count += 1;
+                                self.storage.save_object_metadata(bucket_name, &existing_object_id, &updated_existing_metadata).await?;
+                                
+                                // 更新索引
+                                self.storage.add_object_to_index(bucket_name, key, &new_object_id).await?;
+                                self.storage.add_etag_to_index(bucket_name, &etag, &new_object_id).await?;
+                                
+                                Ok(new_object)
+                            } else {
+                                // 如果找不到现有元数据，正常上传
+                                self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
                             }
+                        } else {
+                            // 如果找不到现有对象ID，正常上传
+                            self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
                         }
-                    }
-                    
-                    // 如果没有找到合适的数据持有者，选择第一个重复对象
-                    let data_holder_id = if let Some(holder_id) = best_holder_id {
-                        holder_id
                     } else {
-                        let first_key = &duplicate_keys[0];
-                        self.storage.find_object_id_by_key(bucket_name, first_key).await?
-                            .ok_or_else(|| anyhow!("Duplicate object not found"))?
-                    };
-                    
-                    // 增加数据持有者的引用计数
-                    if let Some(mut holder_metadata) = self.storage.load_object_metadata(bucket_name, &data_holder_id).await? {
-                        holder_metadata.reference_count += 1;
-                        self.storage.save_object_metadata(bucket_name, &data_holder_id, &holder_metadata).await?;
+                        // 没有重复，正常上传
+                        self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
                     }
-                    
-                    // 创建新对象（指向数据持有者）
-                    let new_object = Object::new(
-                        key.to_string(),
-                        bucket_name.to_string(),
-                        data.len() as u64,
-                        content_type.to_string(),
-                        etag.clone(),
-                        user_metadata,
-                    );
-                    
-                    // 生成新对象ID
-                    let new_object_id = StorageService::generate_object_id(bucket_name, key);
-                    
-                    // 保存新对象元数据
-                    let mut new_metadata: ObjectMetadata = new_object.clone().into();
-                    new_metadata.data_holder_id = Some(data_holder_id.clone());
-                    new_metadata.reference_count = 0; // 新对象本身不计算引用计数
-                    
-                    self.storage.save_object_metadata(bucket_name, &new_object_id, &new_metadata).await?;
-                    
-                    // 更新索引
-                    self.storage.add_object_to_index(bucket_name, key, &new_object_id).await?;
-                    self.storage.add_etag_to_index(bucket_name, &etag, &new_object_id).await?;
-                    
-                    Ok(new_object)
                 } else {
                     // 没有重复，正常上传
-                    self.put_object(bucket_name, key, data, content_type, user_metadata).await
+                    self.put_object_with_custom_etag(bucket_name, key, data, content_type, user_metadata, custom_etag.clone()).await
                 }
             }
         }
@@ -1027,37 +1034,43 @@ impl ObjectService {
         delimiter: Option<String>,
         max_keys: Option<u32>,
         marker: Option<String>,
+        etag_filter: Option<String>,
     ) -> Result<Vec<Object>> {
-        // 检查桶是否存在
-        let bucket = self.storage.buckets.read().await;
-        if !bucket.contains_key(bucket_name) {
-            return Err(anyhow!("Bucket '{}' not found", bucket_name));
-        }
-        drop(bucket);
+        let all_objects = self.storage.list_object_metadata(bucket_name).await?;
         
-        // 使用分页获取元数据
-        let metadata_objects = self.storage.list_object_metadata_with_pagination(
-            bucket_name,
-            max_keys.map(|k| k as usize),
-            marker,
-        ).await?;
-        
-        // 转换为Object列表
-        let mut objects: Vec<Object> = metadata_objects.into_iter().map(|obj| Object::new(
-            obj.key,
-            obj.bucket_name,
-            obj.size,
-            obj.content_type,
-            obj.etag,
-            obj.user_metadata,
-        )).collect();
+        let mut objects: Vec<Object> = all_objects
+            .into_iter()
+            .map(|metadata| Object::new(
+                metadata.key,
+                metadata.bucket_name,
+                metadata.size,
+                metadata.content_type,
+                metadata.etag,
+                metadata.user_metadata,
+            ))
+            .collect();
         
         // 应用前缀过滤
         if let Some(prefix) = prefix {
             objects.retain(|obj| obj.key.starts_with(&prefix));
         }
         
-        // 应用分隔符（简化实现）
+        // 应用ETag过滤
+        if let Some(etag_filter) = etag_filter {
+            objects.retain(|obj| self.matches_etag_filter(&obj.etag, &etag_filter));
+        }
+        
+        // 应用分页
+        if let Some(marker) = marker {
+            objects.retain(|obj| obj.key > marker);
+        }
+        
+        // 应用最大数量限制
+        if let Some(max_keys) = max_keys {
+            objects.truncate(max_keys as usize);
+        }
+        
+        // 应用分隔符过滤
         if let Some(delimiter) = delimiter {
             let mut filtered_objects = Vec::new();
             let mut seen_prefixes = std::collections::HashSet::new();
@@ -1086,6 +1099,25 @@ impl ObjectService {
         }
         
         Ok(objects)
+    }
+    
+    /// 检查ETag是否匹配过滤条件（支持通配符）
+    fn matches_etag_filter(&self, etag: &str, filter: &str) -> bool {
+        // 简单的通配符匹配：* 和 ?
+        if filter.contains('*') || filter.contains('?') {
+            // 将通配符模式转换为正则表达式
+            let pattern = filter
+                .replace(".", "\\.")
+                .replace("*", ".*")
+                .replace("?", ".");
+            
+            if let Ok(regex) = regex::Regex::new(&pattern) {
+                return regex.is_match(etag);
+            }
+        }
+        
+        // 精确匹配
+        etag == filter
     }
     
     /// 测试重复文件处理
@@ -1182,5 +1214,94 @@ impl ObjectService {
         self.storage.remove_object_from_index(bucket_name, key).await?;
         
         Ok(())
+    }
+
+    pub async fn list_objects_with_custom_filter(
+        &self,
+        bucket_name: &str,
+        prefix: Option<String>,
+        delimiter: Option<String>,
+        max_keys: Option<u32>,
+        marker: Option<String>,
+        etag_filter: Option<String>,
+        custom_filters: Vec<(String, String)>,
+    ) -> Result<Vec<Object>> {
+        let mut objects = self.list_objects(bucket_name, prefix, delimiter, max_keys, marker, etag_filter).await?;
+        if !custom_filters.is_empty() {
+            objects.retain(|obj| {
+                custom_filters.iter().all(|(k, v)| {
+                    obj.user_metadata.get(k).map(|val| val == v).unwrap_or(false)
+                })
+            });
+        }
+        Ok(objects)
+    }
+
+    /// 更新对象元数据（不重新上传文件内容）
+    pub async fn update_object_metadata(
+        &self,
+        bucket_name: &str,
+        key: &str,
+        content_type: Option<String>,
+        user_metadata: Option<HashMap<String, String>>,
+        custom_etag: Option<String>,
+    ) -> Result<Object> {
+        // 检查桶是否存在
+        let bucket = self.storage.buckets.read().await;
+        if !bucket.contains_key(bucket_name) {
+            return Err(anyhow!("Bucket '{}' not found", bucket_name));
+        }
+        drop(bucket);
+
+        // 查找对象ID
+        let object_id = self.storage.find_object_id_by_key(bucket_name, key).await?
+            .ok_or_else(|| anyhow!("Object '{}' not found in bucket '{}'", key, bucket_name))?;
+
+        // 加载现有元数据
+        let mut metadata = self.storage.load_object_metadata(bucket_name, &object_id).await?
+            .ok_or_else(|| anyhow!("Object metadata not found for '{}' in bucket '{}'", key, bucket_name))?;
+
+        // 更新内容类型（如果提供）
+        if let Some(ct) = content_type {
+            metadata.content_type = ct;
+        }
+
+        // 更新用户元数据（如果提供）
+        if let Some(um) = user_metadata {
+            metadata.user_metadata = um;
+        }
+
+        // 更新ETag（如果提供）
+        if let Some(etag) = custom_etag {
+            // 验证ETag格式
+            if !is_valid_etag_format(&etag) {
+                return Err(anyhow!("Invalid ETag format: {}", etag));
+            }
+            
+            // 如果ETag发生变化，需要更新索引
+            if metadata.etag != etag {
+                // 从旧ETag索引中移除
+                self.storage.remove_etag_from_index(bucket_name, &metadata.etag, &object_id).await?;
+                // 添加到新ETag索引中
+                self.storage.add_etag_to_index(bucket_name, &etag, &object_id).await?;
+                metadata.etag = etag;
+            }
+        }
+
+        // 更新最后修改时间
+        metadata.last_modified = chrono::Utc::now();
+
+        // 保存更新后的元数据
+        self.storage.save_object_metadata(bucket_name, &object_id, &metadata).await?;
+
+        // 返回更新后的对象
+        Ok(Object::new(
+            key.to_string(),
+            bucket_name.to_string(),
+            metadata.size,
+            metadata.content_type,
+            metadata.etag,
+            metadata.user_metadata,
+        ))
     }
 }

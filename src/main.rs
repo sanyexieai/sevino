@@ -39,12 +39,13 @@ use crate::models::{Bucket, Object, ObjectMetadata};
         get_object,
         delete_object,
         get_object_metadata,
+        update_object_metadata,
         list_object_versions,
         test_duplicate_handling,
         test_reference_mode_api
     ),
     components(
-        schemas(Bucket, Object, ObjectMetadata, ApiResponse<Bucket>, ApiResponse<Vec<Bucket>>, ApiResponse<Object>, ApiResponse<Vec<Object>>, ApiResponse<ObjectMetadata>, ApiResponse<()>, HealthResponse, CreateBucketRequest, PutObjectQuery, MultipartUploadQuery, BucketListResponse, ObjectListResponse)
+        schemas(Bucket, Object, ObjectMetadata, ApiResponse<Bucket>, ApiResponse<Vec<Bucket>>, ApiResponse<Object>, ApiResponse<Vec<Object>>, ApiResponse<ObjectMetadata>, ApiResponse<()>, HealthResponse, CreateBucketRequest, PutObjectQuery, MultipartUploadQuery, UpdateObjectMetadataRequest, BucketListResponse, ObjectListResponse)
     ),
     tags(
         (name = "buckets", description = "Bucket management endpoints"),
@@ -140,6 +141,7 @@ async fn main() {
         .route("/api/buckets/:bucket_name/objects/:key", get(get_object))
         .route("/api/buckets/:bucket_name/objects/:key", delete(delete_object))
         .route("/api/buckets/:bucket_name/objects/:key/metadata", get(get_object_metadata))
+        .route("/api/buckets/:bucket_name/objects/:key/metadata", put(update_object_metadata))
         .route("/api/buckets/:bucket_name/objects/:key/versions", get(list_object_versions))
         .route("/api/buckets/:bucket_name/objects/:key/duplicate-test", post(test_duplicate_handling))
         .route("/api/test/reference-mode", get(test_reference_mode_api))
@@ -288,7 +290,13 @@ async fn delete_bucket(
     path = "/api/buckets/{bucket_name}/objects",
     tag = "objects",
     params(
-        ("bucket_name" = String, Path, description = "Bucket name")
+        ("bucket_name" = String, Path, description = "Bucket name"),
+        ("prefix" = Option<String>, Query, description = "Object key prefix filter"),
+        ("delimiter" = Option<String>, Query, description = "Delimiter for common prefixes"),
+        ("max_keys" = Option<u32>, Query, description = "Maximum number of keys to return"),
+        ("marker" = Option<String>, Query, description = "Pagination marker"),
+        ("etag_filter" = Option<String>, Query, description = "Filter objects by ETag (supports wildcards: *, ?)"),
+        ("custom_*" = Option<String>, Query, description = "Filter by custom metadata, e.g. custom_bizid=123")
     ),
     responses(
         (status = 200, description = "List of objects", body = ApiResponse<ObjectListResponse>),
@@ -298,8 +306,19 @@ async fn delete_bucket(
 async fn list_objects(
     State(state): State<Arc<AppState>>,
     Path(bucket_name): Path<String>,
+    Query(query): Query<ListObjectsQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Json<ApiResponse<ObjectListResponse>> {
-    match state.object_service.list_objects(&bucket_name, None, None, None, None).await {
+    // 解析 custom_xxx=yyy 过滤条件
+    let mut custom_filters = vec![];
+    if let Some(raw) = raw_query {
+        for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+            if let Some(stripped) = k.strip_prefix("custom_") {
+                custom_filters.push((stripped.to_string(), v.to_string()));
+            }
+        }
+    }
+    match state.object_service.list_objects_with_custom_filter(&bucket_name, query.prefix, query.delimiter, query.max_keys, query.marker, query.etag_filter, custom_filters).await {
         Ok(objects) => {
             let response = ObjectListResponse { objects };
             Json(ApiResponse::success(response))
@@ -314,6 +333,22 @@ struct PutObjectQuery {
     deduplication_mode: Option<String>,
     #[serde(default)]
     content_type: Option<String>,
+    #[serde(default)]
+    custom: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct ListObjectsQuery {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    delimiter: Option<String>,
+    #[serde(default)]
+    max_keys: Option<u32>,
+    #[serde(default)]
+    marker: Option<String>,
+    #[serde(default)]
+    etag_filter: Option<String>,
 }
 
 fn default_deduplication_mode() -> Option<String> {
@@ -329,6 +364,39 @@ struct MultipartUploadQuery {
     content_type: Option<String>,
 }
 
+#[derive(Deserialize, utoipa::ToSchema)]
+struct UpdateObjectMetadataRequest {
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    user_metadata: Option<HashMap<String, String>>,
+    #[serde(default)]
+    custom_etag: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket_name}/objects/{key}/metadata",
+    tag = "objects",
+    params(
+        ("bucket_name" = String, Path, description = "Bucket name"),
+        ("key" = String, Path, description = "Object key")
+    ),
+    responses(
+        (status = 200, description = "Object metadata", body = ApiResponse<ObjectMetadata>),
+        (status = 404, description = "Object not found", body = ApiResponse<ObjectMetadata>)
+    )
+)]
+async fn get_object_metadata(
+    State(state): State<Arc<AppState>>,
+    Path((bucket_name, key)): Path<(String, String)>,
+) -> Json<ApiResponse<ObjectMetadata>> {
+    match state.object_service.get_object_metadata(&bucket_name, &key).await {
+        Ok(metadata) => Json(ApiResponse::success(metadata)),
+        Err(e) => Json(ApiResponse::error(e.to_string())),
+    }
+}
+
 #[utoipa::path(
     put,
     path = "/api/buckets/{bucket_name}/objects/{key}",
@@ -337,12 +405,13 @@ struct MultipartUploadQuery {
         ("bucket_name" = String, Path, description = "Bucket name"),
         ("key" = String, Path, description = "Object key"),
         ("deduplication_mode" = Option<String>, Query, description = "Deduplication mode: reject, allow, reference"),
-        ("content_type" = Option<String>, Query, description = "Content type")
+        ("content_type" = Option<String>, Query, description = "Content type"),
+        ("custom_etag" = Option<String>, Query, description = "Custom ETag (e.g., \"md5-hash\", \"sha256-hash\", \"W/weak-etag\")")
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "Object uploaded successfully", body = ApiResponse<Object>),
-        (status = 400, description = "Invalid deduplication mode", body = ApiResponse<Object>),
+        (status = 400, description = "Invalid deduplication mode or ETag format", body = ApiResponse<Object>),
         (status = 404, description = "Bucket not found", body = ApiResponse<Object>)
     )
 )]
@@ -354,7 +423,15 @@ async fn put_object(
 ) -> Json<ApiResponse<Object>> {
     let data = body.to_vec();
     let content_type = query.content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-    let user_metadata = std::collections::HashMap::new();
+    let mut user_metadata = std::collections::HashMap::new();
+
+    // 解析 custom 参数（json字符串）
+    if let Some(custom_str) = &query.custom {
+        match serde_json::from_str::<HashMap<String, String>>(custom_str) {
+            Ok(map) => user_metadata.extend(map),
+            Err(e) => return Json(ApiResponse::error(format!("Invalid custom metadata: {}", e))),
+        }
+    }
 
     // 如果指定了去重模式，使用去重上传
     if let Some(dedup_mode) = query.deduplication_mode {
@@ -387,44 +464,6 @@ async fn put_object(
             Ok(object) => Json(ApiResponse::success(object)),
             Err(e) => Json(ApiResponse::error(e.to_string())),
         }
-    }
-}
-
-#[utoipa::path(
-    put,
-    path = "/api/buckets/{bucket_name}/objects/{key}/multipart",
-    tag = "objects",
-    params(
-        ("bucket_name" = String, Path, description = "Bucket name"),
-        ("key" = String, Path, description = "Object key"),
-        ("part_number" = u32, Query, description = "分片编号，从1开始"),
-        ("total_parts" = u32, Query, description = "总分片数"),
-        ("upload_id" = String, Query, description = "上传ID"),
-        ("content_type" = Option<String>, Query, description = "内容类型")
-    ),
-    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
-    responses(
-        (status = 200, description = "Multipart upload part uploaded successfully", body = ApiResponse<Object>),
-        (status = 400, description = "Invalid multipart upload request", body = ApiResponse<Object>),
-        (status = 404, description = "Bucket not found", body = ApiResponse<Object>)
-    )
-)]
-async fn put_object_multipart(
-    State(state): State<Arc<AppState>>,
-    Path((bucket_name, key)): Path<(String, String)>,
-    Query(query): Query<MultipartUploadQuery>,
-    body: axum::body::Bytes,
-) -> Json<ApiResponse<Object>> {
-    let data = body.to_vec();
-    let content_type = query.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string());
-    let mut user_metadata = std::collections::HashMap::new();
-    user_metadata.insert("multipart_upload_id".to_string(), query.upload_id.clone());
-    user_metadata.insert("part_number".to_string(), query.part_number.to_string());
-    user_metadata.insert("total_parts".to_string(), query.total_parts.to_string());
-    let part_key = format!("{}.part.{}", key, query.part_number);
-    match state.object_service.put_object(&bucket_name, &part_key, data, &content_type, user_metadata).await {
-        Ok(object) => Json(ApiResponse::success(object)),
-        Err(e) => Json(ApiResponse::error(e.to_string())),
     }
 }
 
@@ -479,29 +518,6 @@ async fn delete_object(
 ) -> Json<ApiResponse<()>> {
     match state.object_service.delete_object(&bucket_name, &key).await {
         Ok(_) => Json(ApiResponse::success(())),
-        Err(e) => Json(ApiResponse::error(e.to_string())),
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/buckets/{bucket_name}/objects/{key}/metadata",
-    tag = "objects",
-    params(
-        ("bucket_name" = String, Path, description = "Bucket name"),
-        ("key" = String, Path, description = "Object key")
-    ),
-    responses(
-        (status = 200, description = "Object metadata", body = ApiResponse<ObjectMetadata>),
-        (status = 404, description = "Object not found", body = ApiResponse<ObjectMetadata>)
-    )
-)]
-async fn get_object_metadata(
-    State(state): State<Arc<AppState>>,
-    Path((bucket_name, key)): Path<(String, String)>,
-) -> Json<ApiResponse<ObjectMetadata>> {
-    match state.object_service.get_object_metadata(&bucket_name, &key).await {
-        Ok(metadata) => Json(ApiResponse::success(metadata)),
         Err(e) => Json(ApiResponse::error(e.to_string())),
     }
 }
@@ -760,6 +776,76 @@ async fn test_reference_mode() -> Result<String> {
 async fn test_reference_mode_api() -> Json<ApiResponse<String>> {
     match test_reference_mode().await {
         Ok(result) => Json(ApiResponse::success(result)),
+        Err(e) => Json(ApiResponse::error(e.to_string())),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket_name}/objects/{key}/multipart",
+    tag = "objects",
+    params(
+        ("bucket_name" = String, Path, description = "Bucket name"),
+        ("key" = String, Path, description = "Object key"),
+        ("part_number" = u32, Query, description = "分片编号，从1开始"),
+        ("total_parts" = u32, Query, description = "总分片数"),
+        ("upload_id" = String, Query, description = "上传ID"),
+        ("content_type" = Option<String>, Query, description = "内容类型")
+    ),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "Multipart upload part uploaded successfully", body = ApiResponse<Object>),
+        (status = 400, description = "Invalid multipart upload request", body = ApiResponse<Object>),
+        (status = 404, description = "Bucket not found", body = ApiResponse<Object>)
+    )
+)]
+async fn put_object_multipart(
+    State(state): State<Arc<AppState>>,
+    Path((bucket_name, key)): Path<(String, String)>,
+    Query(query): Query<MultipartUploadQuery>,
+    body: axum::body::Bytes,
+) -> Json<ApiResponse<Object>> {
+    let data = body.to_vec();
+    let content_type = query.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut user_metadata = std::collections::HashMap::new();
+    user_metadata.insert("multipart_upload_id".to_string(), query.upload_id.clone());
+    user_metadata.insert("part_number".to_string(), query.part_number.to_string());
+    user_metadata.insert("total_parts".to_string(), query.total_parts.to_string());
+    let part_key = format!("{}.part.{}", key, query.part_number);
+    match state.object_service.put_object(&bucket_name, &part_key, data, &content_type, user_metadata).await {
+        Ok(object) => Json(ApiResponse::success(object)),
+        Err(e) => Json(ApiResponse::error(e.to_string())),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket_name}/objects/{key}/metadata",
+    tag = "objects",
+    params(
+        ("bucket_name" = String, Path, description = "Bucket name"),
+        ("key" = String, Path, description = "Object key")
+    ),
+    request_body(content = UpdateObjectMetadataRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Object metadata updated successfully", body = ApiResponse<Object>),
+        (status = 400, description = "Invalid ETag format", body = ApiResponse<Object>),
+        (status = 404, description = "Object not found", body = ApiResponse<Object>)
+    )
+)]
+async fn update_object_metadata(
+    State(state): State<Arc<AppState>>,
+    Path((bucket_name, key)): Path<(String, String)>,
+    Json(request): Json<UpdateObjectMetadataRequest>,
+) -> Json<ApiResponse<Object>> {
+    match state.object_service.update_object_metadata(
+        &bucket_name,
+        &key,
+        request.content_type,
+        request.user_metadata,
+        request.custom_etag,
+    ).await {
+        Ok(object) => Json(ApiResponse::success(object)),
         Err(e) => Json(ApiResponse::error(e.to_string())),
     }
 }
