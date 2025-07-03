@@ -459,8 +459,15 @@ async fn put_object(
             Err(e) => Json(ApiResponse::error(e.to_string())),
         }
     } else {
-        // 默认上传模式
-        match state.object_service.put_object(&bucket_name, &key, data, &content_type, user_metadata).await {
+        // 默认上传模式 - 使用 Allow 模式允许重复内容
+        match state.object_service.put_object_with_deduplication(
+            &bucket_name, 
+            &key, 
+            data, 
+            &content_type, 
+            user_metadata,
+            DeduplicationMode::Allow
+        ).await {
             Ok(object) => Json(ApiResponse::success(object)),
             Err(e) => Json(ApiResponse::error(e.to_string())),
         }

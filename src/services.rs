@@ -600,27 +600,8 @@ impl ObjectService {
             content_type.to_string()
         };
         
-        // 检查是否存在相同内容的文件（跨key检测）
-        if self.storage.is_etag_exists(bucket_name, &etag).await? {
-            // 找到相同内容的文件，可以选择：
-            // 1. 拒绝上传（避免重复）
-            // 2. 创建软链接（节省空间）
-            // 3. 正常上传（覆盖）
-            
-            // 这里我们实现选项1：拒绝上传
-            let existing_objects = self.storage.find_objects_by_etag(bucket_name, &etag).await?;
-            if !existing_objects.is_empty() {
-                // 获取第一个相同内容的对象的key
-                if let Some(first_object_id) = existing_objects.first() {
-                    if let Some(existing_metadata) = self.storage.load_object_metadata(bucket_name, first_object_id).await? {
-                        return Err(anyhow!(
-                            "Content already exists with key '{}' (ETag: {}). Use different content or enable deduplication.",
-                            existing_metadata.key, etag
-                        ));
-                    }
-                }
-            }
-        }
+        // 注意：这里移除了硬编码的重复内容检查逻辑
+        // 重复内容检查现在由 put_object_with_deduplication 方法处理
         
         // 检查是否存在相同内容的文件
         if let Some(existing_object_id) = self.storage.find_object_id_by_key(bucket_name, key).await? {
